@@ -1,11 +1,11 @@
 // server.js
-// 武神遊戯 オンライン対戦サーバー
-// - ルーム作成 / 参加
-// - バトル開始（ホスト）
-// - 技投稿 → 準備完了
-// - 全員準備完了で「投票フェーズ」
-// - 投票完了で「結果フェーズ」
-// - 技SNS（/posts）
+// 武神遊戯 オンライン対戦サーバー（Render向け）
+// - ルーム作成/参加
+// - ホスト開始
+// - 技提出（全員提出で投票へ）
+// - 投票（全員投票で結果へ）
+// - 技SNS（投稿/一覧）
+// - いいね（トグル、clientIdで重複防止）
 
 const express = require("express");
 const cors = require("cors");
@@ -17,19 +17,18 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// ========== データ構造 ==========
-
+// -----------------------------
+// In-memory storage
+// -----------------------------
 /**
- * rooms: Map<roomId, Room>
+ * rooms: Map<string, Room>
  * Room = {
- *   roomId,
- *   createdAt,
+ *   roomId: string,
+ *   createdAt: number,
  *   phase: "lobby" | "building" | "voting" | "result",
- *   hostId,
- *   players: [
- *     { id, name, techName, ready, voteFor }
- *   ],
- *   votes: { [targetId]: number },
+ *   hostId: string,
+ *   players: Array<{ id, name, techName, ready, voteFor }>,
+ *   votes: Record<string, number>,
  *   winnerIds: string[],
  *   lastResultText: string | null
  * }
@@ -37,20 +36,30 @@ app.use(express.json());
 const rooms = new Map();
 
 /**
- * posts: 技SNS用
- * { id, author, title, technique, body, createdAt }
+ * posts: Array<Post>
+ * Post = {
+ *   id: string,
+ *   author: string,
+ *   title: string,
+ *   technique: string,
+ *   body: string,
+ *   createdAt: number,
+ *   likes: number,
+ *   likedBy: Set<string> // clientId
+ * }
  */
 const posts = [];
 
-// ========== ヘルパー関数 ==========
-
-function generateRoomId() {
-  // 4桁の数字
-  return String(Math.floor(1000 + Math.random() * 9000));
-}
-
+// -----------------------------
+// Helpers
+// -----------------------------
 function generateId() {
   return crypto.randomBytes(8).toString("hex");
+}
+
+function generateRoomId() {
+  // 4桁数字（衝突したら作り直し）
+  return String(Math.floor(1000 + Math.random() * 9000));
 }
 
 function getRoom(roomId) {
@@ -64,7 +73,7 @@ function getRoom(roomId) {
 }
 
 function getPlayer(room, playerId) {
-  const p = room.players.find(pl => pl.id === playerId);
+  const p = room.players.find((x) => x.id === playerId);
   if (!p) {
     const err = new Error("Player not found in room");
     err.status = 404;
@@ -74,94 +83,101 @@ function getPlayer(room, playerId) {
 }
 
 function toPublicRoom(room) {
-  // プレイヤー側に返してOKな情報だけ返す
   return {
     roomId: room.roomId,
     createdAt: room.createdAt,
     phase: room.phase,
     hostId: room.hostId,
-    players: room.players.map(p => ({
+    players: room.players.map((p) => ({
       id: p.id,
       name: p.name,
       techName: p.techName,
       ready: p.ready,
-      voteFor: p.voteFor || null
+      voteFor: p.voteFor || null,
     })),
     votes: room.votes,
     winnerIds: room.winnerIds,
-    lastResultText: room.lastResultText
+    lastResultText: room.lastResultText,
   };
 }
 
-// ========== ルームAPI ==========
+function safeStr(v, fallback = "") {
+  if (v === null || v === undefined) return fallback;
+  return String(v);
+}
 
-// ルーム作成
+// -----------------------------
+// Health
+// -----------------------------
+app.get("/api/health", (req, res) => {
+  res.json({ ok: true, rooms: rooms.size, posts: posts.length });
+});
+
+// -----------------------------
+// Rooms
+// -----------------------------
+
+// Create room
 app.post("/api/rooms", (req, res, next) => {
   try {
-    const { playerName } = req.body || {};
-    const name = playerName || "プレイヤー";
+    const playerName = safeStr(req.body?.playerName, "プレイヤー").slice(0, 20);
 
     let roomId = generateRoomId();
-    while (rooms.has(roomId)) {
-      roomId = generateRoomId();
-    }
+    while (rooms.has(roomId)) roomId = generateRoomId();
 
-    const playerId = generateId();
+    const hostId = generateId();
 
     const room = {
       roomId,
       createdAt: Date.now(),
       phase: "lobby",
-      hostId: playerId,
+      hostId,
       players: [
-        { id: playerId, name, techName: "", ready: false, voteFor: null }
+        {
+          id: hostId,
+          name: playerName,
+          techName: "",
+          ready: false,
+          voteFor: null,
+        },
       ],
       votes: {},
       winnerIds: [],
-      lastResultText: null
+      lastResultText: null,
     };
 
     rooms.set(roomId, room);
 
-    res.json({
-      roomId,
-      playerId,
-      isHost: true
-    });
+    res.json({ roomId, playerId: hostId, isHost: true });
   } catch (e) {
     next(e);
   }
 });
 
-// ルーム参加
+// Join room
 app.post("/api/rooms/:roomId/join", (req, res, next) => {
   try {
     const roomId = req.params.roomId;
-    const { playerName } = req.body || {};
-    const name = playerName || "プレイヤー";
-
     const room = getRoom(roomId);
 
+    const playerName = safeStr(req.body?.playerName, "プレイヤー").slice(0, 20);
     const playerId = generateId();
+
     room.players.push({
       id: playerId,
-      name,
+      name: playerName,
       techName: "",
       ready: false,
-      voteFor: null
+      voteFor: null,
     });
 
-    res.json({
-      roomId,
-      playerId,
-      isHost: room.hostId === playerId
-    });
+    res.json({ roomId, playerId, isHost: false });
   } catch (e) {
     next(e);
   }
 });
 
-// ルーム状態取得
+// Get room state
 app.get("/api/rooms/:roomId", (req, res, next) => {
   try {
     const room = getRoom(req.params.roomId);
@@ -171,22 +187,21 @@ app.get("/api/rooms/:roomId", (req, res, next) => {
   }
 });
 
-// ホストがバトル開始
+// Host starts battle (reset states)
 app.post("/api/rooms/:roomId/start", (req, res, next) => {
   try {
     const roomId = req.params.roomId;
-    const { playerId } = req.body || {};
-    const room = getRoom(roomId);
+    const playerId = safeStr(req.body?.playerId, "");
 
+    const room = getRoom(roomId);
     if (!playerId || room.hostId !== playerId) {
       const err = new Error("Only host can start battle");
       err.status = 403;
       throw err;
     }
 
-    // 戦闘開始：全員の技と投票状態をリセット
     room.phase = "building";
-    room.players.forEach(p => {
+    room.players.forEach((p) => {
       p.techName = "";
       p.ready = false;
       p.voteFor = null;
@@ -201,11 +216,13 @@ app.post("/api/rooms/:roomId/start", (req, res, next) => {
   }
 });
 
-// 技を送信（＝準備完了）
+// Submit technique (ready)
 app.post("/api/rooms/:roomId/technique", (req, res, next) => {
   try {
     const roomId = req.params.roomId;
-    const { playerId, techName } = req.body || {};
+    const playerId = safeStr(req.body?.playerId, "");
+    const techName = safeStr(req.body?.techName, "").slice(0, 40);
+
     if (!playerId || !techName) {
       const err = new Error("playerId and techName required");
       err.status = 400;
@@ -213,18 +230,24 @@ app.post("/api/rooms/:roomId/technique", (req, res, next) => {
     }
 
     const room = getRoom(roomId);
-    const player = getPlayer(room, playerId);
 
-    player.techName = String(techName);
+    if (room.phase !== "building") {
+      const err = new Error("Not in building phase");
+      err.status = 400;
+      throw err;
+    }
+
+    const player = getPlayer(room, playerId);
+    player.techName = techName;
     player.ready = true;
 
-    // buildingフェーズ中で、全員readyなら投票フェーズへ
-    if (room.phase === "building") {
-      const allReady =
-        room.players.length > 0 && room.players.every(p => p.ready);
-      if (allReady) {
-        room.phase = "voting";
-      }
+    const allReady =
+      room.players.length > 0 && room.players.every((p) => p.ready);
+
+    if (allReady) {
+      room.phase = "voting";
+      // 念のため投票状態はクリア
+      room.players.forEach((p) => (p.voteFor = null));
     }
 
     res.json(toPublicRoom(room));
@@ -233,11 +256,18 @@ app.post("/api/rooms/:roomId/technique", (req, res, next) => {
   }
 });
 
-// 投票
+// Vote
 app.post("/api/rooms/:roomId/vote", (req, res, next) => {
   try {
     const roomId = req.params.roomId;
-    const { playerId, targetPlayerId } = req.body || {};
+    const playerId = safeStr(req.body?.playerId, "");
+    const targetPlayerId = safeStr(req.body?.targetPlayerId, "");
+
+    if (!playerId || !targetPlayerId) {
+      const err = new Error("playerId and targetPlayerId required");
+      err.status = 400;
+      throw err;
+    }
 
     const room = getRoom(roomId);
     if (room.phase !== "voting") {
@@ -257,46 +287,42 @@ app.post("/api/rooms/:roomId/vote", (req, res, next) => {
 
     voter.voteFor = target.id;
 
-    // 全員が投票済みかチェック
     const allVoted =
-      room.players.length > 0 && room.players.every(p => !!p.voteFor);
+      room.players.length > 0 && room.players.every((p) => !!p.voteFor);
+
     if (allVoted) {
-      // 集計
+      // tally
       room.votes = {};
-      room.players.forEach(p => {
-        if (p.voteFor) {
-          room.votes[p.voteFor] = (room.votes[p.voteFor] || 0) + 1;
-        }
+      room.players.forEach((p) => {
+        room.votes[p.id] = 0;
+      });
+      room.players.forEach((p) => {
+        if (p.voteFor) room.votes[p.voteFor] = (room.votes[p.voteFor] || 0) + 1;
       });
 
-      // 最大票数
       let maxVotes = 0;
-      Object.values(room.votes).forEach(v => {
+      Object.values(room.votes).forEach((v) => {
         if (v > maxVotes) maxVotes = v;
       });
 
-      // 勝者（同票なら複数）
       room.winnerIds = Object.entries(room.votes)
         .filter(([_, v]) => v === maxVotes)
         .map(([id]) => id);
 
-      // 結果テキスト
+      // result text
       const lines = [];
       lines.push("投票結果");
-      room.players.forEach(p => {
+      room.players.forEach((p) => {
         const v = room.votes[p.id] || 0;
         lines.push(`・${p.name}「${p.techName || "（未投稿）"}」…… ${v}票`);
       });
 
       if (room.winnerIds.length === 0) {
-        lines.push("\n勝者なし（投票がありませんでした）");
+        lines.push("\n勝者なし");
       } else {
-        const winners = room.players.filter(p =>
-          room.winnerIds.includes(p.id)
-        );
+        const winners = room.players.filter((p) => room.winnerIds.includes(p.id));
         lines.push(
-          "\n🏆 勝者：" +
-            winners.map(w => `${w.name}「${w.techName}」`).join(" ／ ")
+          "\n🏆 勝者：" + winners.map((w) => `${w.name}「${w.techName}」`).join(" ／ ")
         );
       }
 
@@ -310,49 +336,114 @@ app.post("/api/rooms/:roomId/vote", (req, res, next) => {
   }
 });
 
-// ========== 技SNS ==========
+// -----------------------------
+// Posts (Technique SNS)
+// -----------------------------
 
+// Create post
 app.post("/api/posts", (req, res, next) => {
   try {
-    const { author, title, technique, body } = req.body || {};
+    const author = safeStr(req.body?.author, "名無し").slice(0, 20);
+    const title = safeStr(req.body?.title, "").slice(0, 60);
+    const technique = safeStr(req.body?.technique, "").slice(0, 60);
+    const body = safeStr(req.body?.body, "").slice(0, 300);
+
     if (!technique) {
       const err = new Error("technique is required");
       err.status = 400;
       throw err;
     }
+
     const post = {
       id: generateId(),
-      author: author || "名無し",
+      author,
       title: title || technique,
       technique,
-      body: body || "",
-      createdAt: Date.now()
+      body,
+      createdAt: Date.now(),
+      likes: 0,
+      likedBy: new Set(),
     };
+
     posts.unshift(post);
-    if (posts.length > 200) posts.length = 200;
-    res.json(post);
+    if (posts.length > 300) posts.length = 300;
+
+    // SetはJSONにできないので「返す用」は整形
+    res.json({
+      id: post.id,
+      author: post.author,
+      title: post.title,
+      technique: post.technique,
+      body: post.body,
+      createdAt: post.createdAt,
+      likes: post.likes,
+    });
   } catch (e) {
     next(e);
   }
 });
 
+// List posts
 app.get("/api/posts", (req, res, next) => {
   try {
     const limit = Math.min(parseInt(req.query.limit || "20", 10), 100);
-    res.json(posts.slice(0, limit));
+    const sliced = posts.slice(0, limit).map((p) => ({
+      id: p.id,
+      author: p.author,
+      title: p.title,
+      technique: p.technique,
+      body: p.body,
+      createdAt: p.createdAt,
+      likes: p.likes || 0,
+    }));
+    res.json(sliced);
   } catch (e) {
     next(e);
   }
 });
 
-// ========== ヘルスチェック ==========
+// Like toggle
+app.post("/api/posts/:postId/like", (req, res, next) => {
+  try {
+    const postId = req.params.postId;
+    const clientId = safeStr(req.body?.clientId, "").slice(0, 80);
 
-app.get("/api/health", (req, res) => {
-  res.json({ ok: true, rooms: rooms.size, posts: posts.length });
+    if (!clientId) {
+      const err = new Error("clientId required");
+      err.status = 400;
+      throw err;
+    }
+
+    const post = posts.find((p) => p.id === postId);
+    if (!post) {
+      const err = new Error("Post not found");
+      err.status = 404;
+      throw err;
+    }
+
+    if (!post.likedBy) post.likedBy = new Set();
+    if (typeof post.likes !== "number") post.likes = 0;
+
+    let liked;
+    if (post.likedBy.has(clientId)) {
+      post.likedBy.delete(clientId);
+      post.likes = Math.max(0, post.likes - 1);
+      liked = false;
+    } else {
+      post.likedBy.add(clientId);
+      post.likes += 1;
+      liked = true;
+    }
+
+    res.json({ postId: post.id, likes: post.likes, liked });
+  } catch (e) {
+    next(e);
+  }
 });
 
-// ========== エラーハンドラ ==========
-
+// -----------------------------
+// Error handler
+// -----------------------------
 app.use((err, req, res, next) => {
   console.error(err);
   res
@@ -360,8 +451,9 @@ app.use((err, req, res, next) => {
     .json({ error: err.message || "Internal Server Error" });
 });
 
-// ========== サーバー起動 ==========
-
+// -----------------------------
+// Start
+// -----------------------------
 app.listen(PORT, () => {
   console.log(`Bushin server listening on port ${PORT}`);
 });
